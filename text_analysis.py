@@ -7,29 +7,31 @@ from nltk.tokenize import word_tokenize
 from typing import List, Tuple, Dict
 import re
 import nltk
+from semantic_analyzer import SemanticAnalyzer
 
 class TextAnalyzer:
     def __init__(self):
         self._download_nltk_data()
         self.stop_words = set(stopwords.words('english'))
+        self.semantic_analyzer = SemanticAnalyzer()
 
         # Enhanced vectorization parameters
         self.description_vectorizer = TfidfVectorizer(
             stop_words='english',
-            max_features=15000,  # Increased from 10000
-            ngram_range=(1, 4),  # Increased from (1,3) to catch more phrases
+            max_features=15000,
+            ngram_range=(1, 4),
             min_df=1,
-            max_df=0.99,  # Increased to capture more common terms
+            max_df=0.99,
             norm='l2',
             use_idf=True,
             smooth_idf=True,
-            sublinear_tf=True  # Apply sublinear scaling
+            sublinear_tf=True
         )
 
         self.eligibility_vectorizer = TfidfVectorizer(
             stop_words='english',
-            max_features=7000,  # Increased from 5000
-            ngram_range=(1, 3),  # Increased from (1,2)
+            max_features=7000,
+            ngram_range=(1, 3),
             min_df=1,
             max_df=0.99,
             norm='l2',
@@ -40,7 +42,7 @@ class TextAnalyzer:
 
         self.additional_eligibility_vectorizer = TfidfVectorizer(
             stop_words='english',
-            max_features=5000,  # Increased from 3000
+            max_features=5000,
             ngram_range=(1, 3),
             min_df=1,
             max_df=0.99,
@@ -50,13 +52,13 @@ class TextAnalyzer:
             sublinear_tf=True
         )
 
-        # Initialize matrices
+        # Initialize matrices and data
         self.description_matrix = None
         self.eligibility_matrix = None
         self.additional_eligibility_matrix = None
         self.opportunity_numbers = None
-
-        # Initialize nearest neighbors model
+        self.assistance_listings = None
+        self.descriptions = None
         self.description_nn = None
 
     def _download_nltk_data(self):
@@ -73,23 +75,16 @@ class TextAnalyzer:
         """Enhanced text preprocessing for funding descriptions."""
         try:
             text = str(text).lower()
-
-            # Remove special characters but keep important symbols
             text = re.sub(r'[^\w\s$%()-]', ' ', text)
-
-            # Normalize numbers
             text = re.sub(r'\d+', 'NUM', text)
+            text = re.sub(r'pa-\d+', 'PA_NUMBER', text)
+            text = re.sub(r'r\d+', 'R_NUMBER', text)
 
-            # Normalize specific patterns
-            text = re.sub(r'pa-\d+', 'PA_NUMBER', text)  # Normalize PA numbers
-            text = re.sub(r'r\d+', 'R_NUMBER', text)     # Normalize R numbers
-
-            # Tokenize and filter
             tokens = word_tokenize(text)
             tokens = [t for t in tokens if (
                 t.isalnum() or t in {'$', '%', '(', ')', '-'} and
                 t not in self.stop_words and
-                len(t) > 1  # Filter single characters
+                len(t) > 1
             )]
 
             return ' '.join(tokens)
@@ -98,13 +93,16 @@ class TextAnalyzer:
             return text
 
     def fit_transform_data(self, descriptions: List[str], eligibilities: List[str], 
-                         additional_eligibilities: List[str], opportunity_numbers: List[str]) -> None:
+                         additional_eligibilities: List[str], opportunity_numbers: List[str],
+                         assistance_listings: List[str]) -> None:
         """Fit and transform all text data."""
         try:
-            # Store opportunity numbers
+            # Store metadata
             self.opportunity_numbers = opportunity_numbers
+            self.assistance_listings = assistance_listings
+            self.descriptions = descriptions
 
-            # Process descriptions and create embeddings
+            # Process descriptions
             processed_descriptions = [self.preprocess_text(desc) for desc in descriptions]
             self.description_matrix = self.description_vectorizer.fit_transform(processed_descriptions)
 
@@ -116,9 +114,9 @@ class TextAnalyzer:
             processed_add_elig = [self.preprocess_text(add_elig) for add_elig in additional_eligibilities]
             self.additional_eligibility_matrix = self.additional_eligibility_vectorizer.fit_transform(processed_add_elig)
 
-            # Initialize nearest neighbors with more neighbors
+            # Initialize nearest neighbors
             self.description_nn = NearestNeighbors(
-                n_neighbors=min(100, len(descriptions)),  # Increased significantly
+                n_neighbors=min(100, len(descriptions)),
                 metric='cosine',
                 algorithm='brute'
             )
@@ -133,13 +131,14 @@ class TextAnalyzer:
         similarity = cosine_similarity(matrix1, matrix2)[0][0]
         return float(similarity)
 
-    def find_similar_opportunities(self, query_desc: str, query_elig: str, query_add_elig: str) -> List[Tuple[int, Dict[str, float]]]:
+    def find_similar_opportunities(self, query_desc: str, query_elig: str, query_add_elig: str, 
+                                 current_opp_number: str) -> List[Tuple[int, Dict]]:
         """Find similar opportunities using enhanced vector embeddings."""
         if not self.description_nn:
             raise ValueError("Model not fitted. Call fit_transform_data first.")
 
         try:
-            # Process query texts
+            # Process queries
             processed_desc = self.preprocess_text(query_desc)
             processed_elig = self.preprocess_text(query_elig)
             processed_add_elig = self.preprocess_text(query_add_elig)
@@ -149,36 +148,51 @@ class TextAnalyzer:
             query_elig_vector = self.eligibility_vectorizer.transform([processed_elig])
             query_add_elig_vector = self.additional_eligibility_vectorizer.transform([processed_add_elig])
 
-            # Find nearest neighbors based on description first
+            # Find nearest neighbors
             distances, indices = self.description_nn.kneighbors(query_desc_vector)
 
-            # Calculate detailed similarity scores using vector embeddings
+            # Calculate similarities
             similar_opportunities = []
             for idx, desc_dist in zip(indices[0], distances[0]):
-                # Calculate similarities using vector embeddings
-                desc_sim = 1 - desc_dist  # Convert distance to similarity
+                # Skip self-matches
+                if self.opportunity_numbers[idx] == current_opp_number:
+                    continue
 
-                # Calculate other similarities using cosine similarity
+                # Calculate vector-based similarities
+                desc_sim = 1 - desc_dist
                 elig_sim = self.calculate_vector_similarity(
                     query_elig_vector,
                     self.eligibility_matrix[idx:idx+1]
                 )
-
                 add_elig_sim = self.calculate_vector_similarity(
                     query_add_elig_vector,
                     self.additional_eligibility_matrix[idx:idx+1]
                 )
 
-                # Weight the similarities with adjusted weights
-                # Description: 60%, Eligibility: 25%, Additional Eligibility: 15%
+                # Calculate semantic similarity
+                semantic_analysis = self.semantic_analyzer.analyze_opportunity_pair(
+                    query_desc,
+                    self.descriptions[idx]
+                )
+                semantic_sim = semantic_analysis['semantic_similarity']
+
+                # Calculate combined score with semantic weight
+                # Vector similarities: 70% (Description: 35%, Eligibility: 25%, Additional: 10%)
+                # Semantic similarity: 30%
                 combined_score = (
-                    0.60 * desc_sim +
+                    0.35 * desc_sim +
                     0.25 * elig_sim +
-                    0.15 * add_elig_sim
+                    0.10 * add_elig_sim +
+                    0.30 * semantic_sim
                 )
 
-                # Lower threshold and include opportunity number
                 if combined_score > 0.01:  # 1% minimum similarity threshold
+                    # Get semantic explanation
+                    semantic_explanation = self.semantic_analyzer.get_semantic_explanation(
+                        semantic_analysis['source_concepts'],
+                        semantic_analysis['target_concepts']
+                    )
+
                     similar_opportunities.append((
                         int(idx),
                         {
@@ -186,7 +200,10 @@ class TextAnalyzer:
                             'description_similarity': float(desc_sim),
                             'eligibility_similarity': float(elig_sim),
                             'additional_eligibility_similarity': float(add_elig_sim),
-                            'combined_score': float(combined_score)
+                            'semantic_similarity': float(semantic_sim),
+                            'combined_score': float(combined_score),
+                            'assistance_listing': self.assistance_listings[idx],
+                            'semantic_explanation': semantic_explanation
                         }
                     ))
 
